@@ -5,7 +5,15 @@ import os
 
 app = FastAPI()
 
-r = redis.Redis(host="localhost", port=6379)
+r = redis.Redis(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=int(os.getenv("REDIS_PORT", 6379))
+)
+
+# Ensure Redis is reachable on startup
+@app.on_event("startup")
+def startup():
+    r.ping()
 
 @app.post("/jobs")
 def create_job():
@@ -20,3 +28,12 @@ def get_job(job_id: str):
     if not status:
         return {"error": "not found"}
     return {"job_id": job_id, "status": status.decode()}
+
+# Health endpoint for Docker/CI checks
+@app.get("/health")
+def health():
+    try:
+        r.ping()
+        return {"status": "ok"}
+    except Exception:
+        return {"status": "degraded"}

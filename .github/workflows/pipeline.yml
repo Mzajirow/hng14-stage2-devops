@@ -1,0 +1,306 @@
+name: CI/CD Pipeline
+
+"on":
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # 1. LINT
+  # ─────────────────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Lint Python (flake8)
+        run: flake8 api worker --max-line-length=120
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Lint JavaScript (eslint)
+        run: |
+          cd frontend
+          npm ci
+          npx eslint .
+
+      - name: Install hadolint
+        run: |
+          wget -qO /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+
+      - name: Lint Dockerfiles (hadolint)
+        run: hadolint frontend/Dockerfile api/Dockerfile worker/Dockerfile
+
+  # ─────────────────────────────────────────────
+  # 2. TEST
+  # ─────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install pytest pytest-cov fakeredis fastapi uvicorn redis
+
+      - name: Run tests with coverage
+        run: |
+          cd api
+          pytest --cov=. --cov-report=xml --cov-report=html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            api/coverage.xml
+            api/htmlcov/
+
+  # ─────────────────────────────────────────────
+  # 3. BUILD
+  # ─────────────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      sha: ${{ steps.set-sha.outputs.sha }}
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: set-sha
+        run: |
+          SHA=${GITHUB_SHA::7}
+          echo "SHA=$SHA" >> $GITHUB_ENV
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Build and push frontend
+        run: |
+          docker build -t localhost:5000/frontend:$SHA -t localhost:5000/frontend:latest ./frontend
+          docker push localhost:5000/frontend:$SHA
+          docker push localhost:5000/frontend:latest
+
+      - name: Build and push backend
+        run: |
+          docker build -t localhost:5000/backend:$SHA -t localhost:5000/backend:latest ./api
+          docker push localhost:5000/backend:$SHA
+          docker push localhost:5000/backend:latest
+
+      - name: Build and push worker
+        run: |
+          docker build -t localhost:5000/worker:$SHA -t localhost:5000/worker:latest ./worker
+          docker push localhost:5000/worker:$SHA
+          docker push localhost:5000/worker:latest
+
+  # ─────────────────────────────────────────────
+  # 4. SECURITY SCAN
+  # ─────────────────────────────────────────────
+  security:
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    permissions:
+      security-events: write
+    env:
+      SHA: ${{ needs.build.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull images from registry
+        run: |
+          docker pull localhost:5000/backend:$SHA
+          docker pull localhost:5000/frontend:$SHA
+          docker pull localhost:5000/worker:$SHA
+
+      - name: Scan backend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: localhost:5000/backend:${{ env.SHA }}
+          format: sarif
+          output: trivy-backend.sarif
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Scan frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: localhost:5000/frontend:${{ env.SHA }}
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Scan worker
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: localhost:5000/worker:${{ env.SHA }}
+          format: sarif
+          output: trivy-worker.sarif
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: .
+
+      - name: Upload SARIF artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif-results
+          path: "*.sarif"
+
+  # ─────────────────────────────────────────────
+  # 5. INTEGRATION TEST
+  # ─────────────────────────────────────────────
+  integration:
+    runs-on: ubuntu-latest
+    needs: security
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    env:
+      SHA: ${{ needs.build.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull and tag images
+        run: |
+          docker pull localhost:5000/backend:$SHA
+          docker pull localhost:5000/frontend:$SHA
+          docker pull localhost:5000/worker:$SHA
+          docker tag localhost:5000/backend:$SHA backend:latest
+          docker tag localhost:5000/frontend:$SHA frontend:latest
+          docker tag localhost:5000/worker:$SHA worker:latest
+
+      - name: Start stack
+        run: docker compose up -d
+        env:
+          REDIS_HOST: redis
+          REDIS_PORT: 6379
+          API_URL: http://backend:8000
+
+      - name: Wait for backend
+        run: |
+          for i in {1..30}; do
+            curl -sf http://localhost:8000/health && echo "Backend ready" && break
+            echo "Attempt $i — waiting..."
+            sleep 2
+          done
+
+      - name: Wait for frontend
+        run: |
+          for i in {1..20}; do
+            curl -sf http://localhost:3000 && echo "Frontend ready" && break
+            sleep 2
+          done
+
+      - name: Submit job through frontend
+        run: |
+          JOB_ID=$(curl -sf -X POST http://localhost:3000/submit \
+            -H "Content-Type: application/json" | jq -r .job_id)
+          echo "JOB_ID=$JOB_ID" >> $GITHUB_ENV
+          echo "Submitted job: $JOB_ID"
+
+      - name: Poll until completed
+        run: |
+          for i in {1..30}; do
+            STATUS=$(curl -sf http://localhost:3000/status/$JOB_ID | jq -r .status)
+            echo "Attempt $i — status: $STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              echo "Job completed successfully"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Job did not complete — final status: $STATUS"
+          exit 1
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  # ─────────────────────────────────────────────
+  # 6. DEPLOY (main branch only)
+  # ─────────────────────────────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    env:
+      SHA: ${{ needs.build.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy with rolling update
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          echo "$DEPLOY_KEY" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+          ssh -i /tmp/deploy_key \
+            -o StrictHostKeyChecking=no \
+            $DEPLOY_USER@$DEPLOY_HOST "bash -s" << 'EOF'
+          set -e
+
+          rolling_update() {
+            local SERVICE=$1
+            local IMAGE=$2
+            local HEALTH_URL=$3
+            local NEW_NAME="${SERVICE}_new_${SHA}"
+            local OLD_ID=$(docker ps -qf "name=${SERVICE}" | head -1)
+
+            echo "Starting new ${SERVICE}..."
+            docker run -d \
+              --name $NEW_NAME \
+              --network app-network \
+              --env-file /app/.env \
+              $IMAGE:$SHA
+
+            echo "Waiting up to 60s for health check..."
+            for i in {1..30}; do
+              if curl -sf $HEALTH_URL > /dev/null 2>&1; then
+                echo "${SERVICE} is healthy — stopping old container"
+                [ -n "$OLD_ID" ] && docker stop $OLD_ID && docker rm $OLD_ID
+                docker rename $NEW_NAME $SERVICE
+                return 0
+              fi
+              sleep 2
+            done
+
+            echo "Health check failed — rolling back"
+            docker stop $NEW_NAME && docker rm $NEW_NAME
+            return 1
+          }
+
+          rolling_update backend  localhost:5000/backend  http://localhost:8000/health
+          rolling_update worker   localhost:5000/worker   http://localhost:8000/health
+          rolling_update frontend localhost:5000/frontend http://localhost:3000
+          EOF
